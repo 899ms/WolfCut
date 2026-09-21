@@ -1,0 +1,94 @@
+# .github/workflows/safe-fork-sync.yml
+# 安全的定时"同步上游"工作流：
+#   - 上游被删除     → fetch 失败，安全跳过（你的 fork 不受影响）
+#   - 上游被清空(情况B) → 检测到文件骤减，跳过并开 issue 报警，绝不把清空同步进来
+#   - 正常更新       → 先打远程安全点 tag，再合并上游并推送（可随时回滚）
+# 放到 fork 仓库的 .github/workflows/ 下即可（必须在默认分支）。
+name: Safe Fork Sync
+
+on:
+  schedule:
+    - cron: "54 11 * * 3"   # weekly, randomized
+  workflow_dispatch: {}      # 也可在 Actions 页手动触发
+
+permissions:
+  contents: write            # 推送同步结果、打 tag
+  issues: write              # 检测到异常时开 issue 报警
+
+env:
+  MIN_FILE_RATIO: "0.40"     # 上游文件数 < 当前的 40% 视为"删库/清空"→ 跳过
+  MIN_FILE_COUNT: "3"        # 上游文件数低于该绝对值也视为异常
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (完整历史)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 解析上游仓库
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          parent=$(gh api "repos/${{ github.repository }}" --jq '.parent.full_name // empty')
+          if [ -z "$parent" ]; then
+            echo "不是 fork，或上游已被删除 → 无需同步，你的库安全。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          branch=$(gh api "repos/$parent" --jq '.default_branch')
+          echo "parent=$parent" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "上游: $parent（默认分支 $branch）"
+
+      - name: 拉取上游（上游删除时安全跳过）
+        if: steps.up.outputs.skip != 'true'
+        id: fetch
+        run: |
+          git remote add upstream "https://github.com/${{ steps.up.outputs.parent }}.git"
+          if ! git fetch upstream "${{ steps.up.outputs.branch }}"; then
+            echo "拉取上游失败（可能已删除/转私有）→ 跳过，你的 fork 不受影响。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+      - name: 防清空守卫（情况 B）
+        if: steps.up.outputs.skip != 'true' && steps.fetch.outputs.skip != 'true'
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cur=$(git ls-tree -r --name-only HEAD | wc -l)
+          up=$(git ls-tree -r --name-only "upstream/${{ steps.up.outputs.branch }}" | wc -l)
+          min=$(awk "BEGIN{printf \"%d\", $cur * $MIN_FILE_RATIO}")
+          echo "当前文件数=$cur  上游文件数=$up  阈值=$min"
+          if [ "$up" -lt "$MIN_FILE_COUNT" ] || [ "$up" -lt "$min" ]; then
+            echo "::warning::上游文件数骤降（$cur → $up），疑似删库/清空，已跳过同步以保护本 fork。"
+            title="⚠️ 上游疑似删库/清空，已自动跳过同步"
+            # 避免重复开 issue
+            if [ -z "$(gh issue list --state open --search "$title" --json number --jq '.[0].number')" ]; then
+              gh issue create --title "$title" \
+                --body "定时同步检测到上游 \`${{ steps.up.outputs.parent }}\` 文件数从 **$cur** 骤降到 **$up**（低于阈值 ${MIN_FILE_RATIO}）。为保护本 fork，本次同步已跳过。请人工确认后再决定是否手动同步。" \
+                2>/dev/null || true
+            fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+      - name: 安全点 + 合并 + 推送
+        if: steps.up.outputs.skip != 'true' && steps.fetch.outputs.skip != 'true' && steps.guard.outputs.skip != 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 1) 远程安全点：把同步前的状态打成 tag，可随时回滚
+          tag="safepoint/$(date -u +%Y%m%d-%H%M)"
+          git tag "$tag" HEAD && git push origin "$tag" || true
+          # 2) 合并上游（保留本 workflow 等本地新增文件；有冲突则中止不动你的分支）
+          if git merge --no-edit "upstream/${{ steps.up.outputs.branch }}"; then
+            git push origin HEAD
+            echo "✅ 已同步上游；回滚点 = $tag"
+          else
+            git merge --abort
+            echo "::warning::与上游有冲突，已中止合并，未改动你的分支。"
+          fi
